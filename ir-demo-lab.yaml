@@ -1,0 +1,644 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Single-account incident-response demo lab (free-tier friendly): EC2+SSM, S3, SNS, EventBridge, Lambdas for auto-remediation.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address to receive security alerts (you must confirm the SNS subscription email)
+  YourIpCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed for SSH to the demo EC2 (e.g., 203.0.113.10/32)
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: ''
+    Description: Optional EC2 key pair for SSH
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro, t3a.micro]
+    Description: Free-tier instance type
+  AmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: Latest Amazon Linux 2023 AMI
+  ScheduleMinutes:
+    Type: Number
+    Default: 1440
+    Description: How often (minutes) to run scheduled checks (set 5 during live demo)
+  StaleKeyDays:
+    Type: Number
+    Default: 90
+    Description: Days after which IAM access keys are considered stale
+  ParamRotationPrefix:
+    Type: String
+    Default: /lab/secret/
+    Description: Parameter Store prefix for “secrets” to auto-rotate
+  ParamRotateAfterDays:
+    Type: Number
+    Default: 30
+    Description: Rotate parameters under the prefix after this many days
+  AutoCreateNewIamKey:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true','false']
+    Description: If 'true', create new IAM keys and store in Parameter Store; else just disable stale keys
+
+Mappings: {}
+
+Conditions:
+  HasKey: !Not [!Equals [!Ref KeyName, ""]]
+
+Resources:
+  ########################################################
+  # Networking + EC2
+  ########################################################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.10.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: ir-demo-vpc }]
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: ir-demo-igw }]
+
+  AttachIgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref IGW
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: ir-demo-public-1a }]
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: ir-demo-rtb }]
+
+  RouteDefault:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+  RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Demo EC2 SG (HTTP open, SSH limited)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref YourIpCidr
+      Tags: [{ Key: Name, Value: ir-demo-ec2-sg }]
+
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ParamReadLabPrefix
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParamRotationPrefix}*
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Ec2Role]
+      Path: /
+
+  DemoInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              httpd: []
+          files:
+            /var/www/html/index.html:
+              content: |
+                <html><body style="font-family:Arial">
+                <h2>IR Demo App</h2>
+                <p>Hello from the demo server.</p>
+                </body></html>
+              mode: '000644'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              httpd:
+                enabled: true
+                ensureRunning: true
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      KeyName: !If [HasKey, !Ref KeyName, !Ref 'AWS::NoValue']
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref Ec2SecurityGroup]
+      Tags:
+        - { Key: Name, Value: ir-demo-ec2 }
+        - { Key: PatchGroup, Value: ir-demo }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+          dnf -y update
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource DemoInstance --region ${AWS::Region}
+          systemctl enable --now amazon-ssm-agent
+
+  ########################################################
+  # Buckets + SNS
+  ########################################################
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ir-demo-logs-${AWS::AccountId}-${AWS::Region}
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags: [{ Key: Name, Value: ir-demo-logs }]
+
+  AppBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ir-demo-app-${AWS::AccountId}-${AWS::Region}
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Suspended
+      Tags: [{ Key: Name, Value: ir-demo-app }]
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: IR Demo Alerts
+
+  AlertsSubscriptionEmail:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  ########################################################
+  # Lambda execution role (shared) + log groups
+  ########################################################
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaCoreAndSNSLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertsTopic
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${LogsBucket}/*
+        - PolicyName: LambdaS3Guard
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketPolicy
+                  - s3:DeleteBucketPolicy
+                  - s3:GetBucketAcl
+                  - s3:PutBucketAcl
+                  - s3:PutBucketPublicAccessBlock
+                Resource: !Sub arn:${AWS::Partition}:s3:::*
+        - PolicyName: LambdaEc2SgGuard
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:DescribeSecurityGroups
+                Resource: "*"
+        - PolicyName: LambdaSsmPatchAndParams
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:ListCommands
+                  - ssm:ListCommandInvocations
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeParameters
+                  - ssm:GetParameter
+                  - ssm:GetParametersByPath
+                  - ssm:PutParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter*
+              - Effect: Allow
+                Action:
+                  - iam:ListUsers
+                  - iam:ListAccessKeys
+                  - iam:GetAccessKeyLastUsed
+                  - iam:UpdateAccessKey
+                  - iam:CreateAccessKey
+                  - iam:DeleteAccessKey
+                Resource: "*"
+
+  ########################################################
+  # Lambdas (inline code kept tight)
+  ########################################################
+  S3PublicRevertFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          LOGS_BUCKET: !Ref LogsBucket
+          ALERTS_TOPIC: !Ref AlertsTopic
+      Code:
+        ZipFile: |
+          import json, boto3, os, datetime
+          s3 = boto3.client('s3'); sns=boto3.client('sns')
+          def is_public_acl(ac):
+              for g in ac.get('Grants', []):
+                  uri = g.get('Grantee', {}).get('URI','')
+                  if 'AllUsers' in uri or 'AuthenticatedUsers' in uri:
+                      return True
+              return False
+          def handler(event, ctx):
+              d = event.get('detail',{})
+              bucket = d.get('requestParameters',{}).get('bucketName')
+              if not bucket: return {"ok":True}
+              # Enforce block public access
+              s3.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration={
+                  'BlockPublicAcls': True,'IgnorePublicAcls': True,'BlockPublicPolicy': True,'RestrictPublicBuckets': True
+              })
+              # If policy exists and contains wildcard principal, delete it
+              try:
+                  pol = s3.get_bucket_policy(Bucket=bucket)
+                  if '"Principal":"*"' in pol['Policy'] or '"AWS":"*"' in pol['Policy']:
+                      s3.delete_bucket_policy(Bucket=bucket)
+                      pol_removed = True
+                  else: pol_removed=False
+              except s3.exceptions.from_code('NoSuchBucketPolicy'):
+                  pol_removed=False
+              # Fix ACL
+              acl = s3.get_bucket_acl(Bucket=bucket)
+              if is_public_acl(acl): s3.put_bucket_acl(Bucket=bucket, ACL='private'); acl_fixed=True
+              else: acl_fixed=False
+              msg = f"S3 public access change detected on bucket '{bucket}'. BPA enforced. Policy removed: {pol_removed}. ACL fixed: {acl_fixed}."
+              sns.publish(TopicArn=os.environ['ALERTS_TOPIC'], Message=msg, Subject="S3 Public Access Auto-Remediation")
+              # Audit log
+              key = f"s3-remediation/{bucket}-{datetime.datetime.utcnow().isoformat()}.json"
+              boto3.client('s3').put_object(Bucket=os.environ['LOGS_BUCKET'], Key=key, Body=json.dumps({'event':d,'message':msg}))
+              return {"message": msg}
+
+  SgGuardFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          ALERTS_TOPIC: !Ref AlertsTopic
+      Code:
+        ZipFile: |
+          import boto3, os
+          ec2 = boto3.client('ec2'); sns=boto3.client('sns')
+          SENSITIVE = {22,3389,3306,5432,6379,9200}
+          def handler(event, ctx):
+              d=event.get('detail',{})
+              params=d.get('requestParameters',{}) or {}
+              gid=params.get('groupId')
+              perms=params.get('ipPermissions',[])
+              revoked=[]
+              for p in perms:
+                  fromp=p.get('fromPort'); top=p.get('toPort'); proto=p.get('ipProtocol')
+                  if proto!='tcp': continue
+                  rngs = [r.get('cidrIp') for r in p.get('ipRanges',[])]
+                  if '0.0.0.0/0' in rngs and any(port in SENSITIVE for port in range(fromp, (top or fromp)+1)):
+                      try:
+                          ec2.revoke_security_group_ingress(GroupId=gid, IpPermissions=[p])
+                          revoked.append({'from':fromp,'to':top})
+                      except Exception as e:
+                          pass
+              if revoked:
+                  msg=f"Wide SG ingress removed on {gid}: {revoked}"
+                  sns.publish(TopicArn=os.environ['ALERTS_TOPIC'], Subject="Security Group Auto-Remediation", Message=msg)
+              return {'revoked':revoked}
+
+  PatchNowFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          ALERTS_TOPIC: !Ref AlertsTopic
+      Code:
+        ZipFile: |
+          import boto3, os
+          ssm=boto3.client('ssm'); sns=boto3.client('sns')
+          def handler(event, ctx):
+              d=event.get('detail',{})
+              status=d.get('status'); ctype=d.get('complianceType'); rid=d.get('resourceId')
+              if status!='NON_COMPLIANT' or ctype!='Patch' or not rid: return {'skipped':True}
+              ssm.send_command(InstanceIds=[rid], DocumentName='AWS-RunPatchBaseline',
+                               Parameters={'Operation':['Install'],'RebootOption':['RebootIfNeeded']})
+              msg=f"Triggered AWS-RunPatchBaseline on instance {rid} due to NON_COMPLIANT Patch status."
+              sns.publish(TopicArn=os.environ['ALERTS_TOPIC'], Subject='Patch Auto-Remediation', Message=msg)
+              return {'ok':True}
+
+  ParamRotatorFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 120
+      Environment:
+        Variables:
+          PREFIX: !Ref ParamRotationPrefix
+          ROTATE_AFTER_DAYS: !Ref ParamRotateAfterDays
+          ALERTS_TOPIC: !Ref AlertsTopic
+      Code:
+        ZipFile: |
+          import boto3, os, time, secrets, string, datetime
+          ssm=boto3.client('ssm'); sns=boto3.client('sns')
+          def strong(n=32):
+              a=string.ascii_letters+string.digits+'!@#%^*-_'
+              return ''.join(secrets.choice(a) for _ in range(n))
+          def handler(event, ctx):
+              prefix=os.environ['PREFIX']; days=int(os.environ['ROTATE_AFTER_DAYS'])
+              next_token=None; rotated=[]
+              cutoff=time.time()-days*86400
+              while True:
+                  resp=ssm.get_parameters_by_path(Path=prefix, Recursive=True, WithDecryption=False, NextToken=next_token) if next_token else ssm.get_parameters_by_path(Path=prefix, Recursive=True, WithDecryption=False)
+                  for p in resp.get('Parameters',[]):
+                      md=ssm.describe_parameters(Filters=[{'Key':'Name','Values':[p['Name']]}])['Parameters'][0]
+                      last=md.get('LastModifiedDate').timestamp()
+                      if last<=cutoff:
+                          new=strong()
+                          ssm.put_parameter(Name=p['Name'], Value=new, Type='SecureString', Overwrite=True, KeyId='alias/aws/ssm')
+                          rotated.append(p['Name'])
+                  next_token=resp.get('NextToken')
+                  if not next_token: break
+              if rotated:
+                  msg=f"Rotated {len(rotated)} parameter(s): {', '.join(rotated[:10])}{' ...' if len(rotated)>10 else ''}"
+                  sns.publish(TopicArn=os.environ['ALERTS_TOPIC'], Subject='Parameter Rotation', Message=msg)
+              return {'rotated':len(rotated)}
+
+  IamStaleKeyCleanerFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 180
+      Environment:
+        Variables:
+          STALE_DAYS: !Ref StaleKeyDays
+          AUTO_NEW: !Ref AutoCreateNewIamKey
+          PARAM_PREFIX: /iam/
+          ALERTS_TOPIC: !Ref AlertsTopic
+      Code:
+        ZipFile: |
+          import boto3, os, datetime
+          iam=boto3.client('iam'); ssm=boto3.client('ssm'); sns=boto3.client('sns')
+          def handler(event, ctx):
+              stale_days=int(os.environ['STALE_DAYS'])
+              auto_new=os.environ['AUTO_NEW'].lower()=='true'
+              cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=stale_days)
+              disabled=[]; created=[]
+              users=iam.list_users()['Users']
+              for u in users:
+                  uname=u['UserName']
+                  keys=iam.list_access_keys(UserName=uname)['AccessKeyMetadata']
+                  for k in keys:
+                      kid=k['AccessKeyId']
+                      last=iam.get_access_key_last_used(AccessKeyId=kid)['AccessKeyLastUsed'].get('LastUsedDate')
+                      if not last or last < cutoff:
+                          iam.update_access_key(UserName=uname, AccessKeyId=kid, Status='Inactive')
+                          disabled.append((uname,kid))
+                          if auto_new:
+                              nk=iam.create_access_key(UserName=uname)['AccessKey']
+                              ssm.put_parameter(Name=f"/iam/{uname}/access_key_id", Value=nk['AccessKeyId'], Type='SecureString', Overwrite=True, KeyId='alias/aws/ssm')
+                              ssm.put_parameter(Name=f"/iam/{uname}/secret_access_key", Value=nk['SecretAccessKey'], Type='SecureString', Overwrite=True, KeyId='alias/aws/ssm')
+                              created.append(uname)
+              if disabled:
+                  msg=f"Disabled {len(disabled)} stale access key(s). Users with new keys: {', '.join(set(created)) if created else 'none'}."
+                  sns.publish(TopicArn=os.environ['ALERTS_TOPIC'], Subject='IAM Key Remediation', Message=msg)
+              return {'disabled':len(disabled),'created_new_for':list(set(created))}
+
+  ########################################################
+  # EventBridge rules & permissions
+  ########################################################
+  RuleS3PolicyAclChanges:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Detect S3 policy/ACL changes
+      EventPattern:
+        source: ["aws.s3"]
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          eventSource: ["s3.amazonaws.com"]
+          eventName: ["PutBucketPolicy","PutBucketAcl"]
+      Targets:
+        - Arn: !GetAtt S3PublicRevertFn.Arn
+          Id: tgt1
+        - Arn: !Ref AlertsTopic
+          Id: sns1
+          InputTransformer:
+            InputPathsMap:
+              bucket: $.detail.requestParameters.bucketName
+              name: $.detail.eventName
+            InputTemplate: '"S3 config change detected on <bucket> via <name>. Auto-remediation Lambda invoked."'
+  PermInvokeS3Fn:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref S3PublicRevertFn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RuleS3PolicyAclChanges.Arn
+
+  RuleEc2SgIngress:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Detect broad SG ingress (0.0.0.0/0)
+      EventPattern:
+        source: ["aws.ec2"]
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          eventSource: ["ec2.amazonaws.com"]
+          eventName: ["AuthorizeSecurityGroupIngress"]
+      Targets:
+        - Arn: !GetAtt SgGuardFn.Arn
+          Id: tgt1
+  PermInvokeSgFn:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SgGuardFn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RuleEc2SgIngress.Arn
+
+  RuleSsmComplianceChange:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Patch compliance change
+      EventPattern:
+        source: ["aws.ssm"]
+        detail-type: ["Compliance Change"]
+      Targets:
+        - Arn: !GetAtt PatchNowFn.Arn
+          Id: tgt1
+        - Arn: !Ref AlertsTopic
+          Id: sns1
+          InputTransformer:
+            InputPathsMap:
+              rid: $.detail.resourceId
+              status: $.detail.status
+              ctype: $.detail.complianceType
+            InputTemplate: '"SSM Compliance change on <rid>: <ctype>=<status>. Triggering remediation if needed."'
+  PermInvokePatchNow:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PatchNowFn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RuleSsmComplianceChange.Arn
+
+  RuleParamRotateSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: !Sub rate(${ScheduleMinutes} minutes)
+      Description: Scheduled parameter rotation
+      Targets:
+        - Arn: !GetAtt ParamRotatorFn.Arn
+          Id: tgt1
+  PermInvokeParamRotator:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ParamRotatorFn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RuleParamRotateSchedule.Arn
+
+  RuleIamStaleKeySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: !Sub rate(${ScheduleMinutes} minutes)
+      Description: Scheduled IAM key stale checker
+      Targets:
+        - Arn: !GetAtt IamStaleKeyCleanerFn.Arn
+          Id: tgt1
+  PermInvokeIamKeyCleaner:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IamStaleKeyCleanerFn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RuleIamStaleKeySchedule.Arn
+
+  ########################################################
+  # SSM Patch scan association (to generate compliance)
+  ########################################################
+  PatchScanAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AWS-RunPatchBaseline
+      AssociationName: ir-demo-patch-scan
+      ScheduleExpression: cron(0 */6 * * ? *) # every 6 hours
+      Parameters:
+        Operation: [ Scan ]
+      Targets:
+        - Key: InstanceIds
+          Values: [ !Ref DemoInstance ]
+
+Outputs:
+  InstancePublicIP:
+    Description: Public IP of demo EC2
+    Value: !GetAtt DemoInstance.PublicIp
+  AppBucketName:
+    Description: Application bucket name (try making it public to demo remediation)
+    Value: !Ref AppBucket
+  LogsBucketName:
+    Description: Bucket where remediation logs are written
+    Value: !Ref LogsBucket
+  AlertsTopicArn:
+    Description: SNS Topic ARN for alerts (confirm the email!)
+    Value: !Ref AlertsTopic
